@@ -174,13 +174,6 @@ PKG_DIR="$HOME/.local/bin/GenomicTools"
 PKG_BIN="$PKG_DIR/bin"
 PYTHONRC_FILE="$HOME/.pythonrc.py"
 
-# Set permissions for the dispatcher
-chmod +x "$SCRIPT_DIR/dispatch.sh"
-chmod 750 "$SCRIPT_DIR/dispatch.sh"
-
-# Set permissions for the uninstaller
-chmod +x "$SCRIPT_DIR/uninstall.sh"
-
 # Get user confirmation
 echo "The scripts will be installed to $PKG_DIR."
 read -r -p "Do you want to continue with the installation? (y/n): " -n 1 -r
@@ -195,12 +188,23 @@ echo "Copying scripts..."
 mkdir -p "$PKG_DIR/scripts"
 mkdir -p "$PKG_DIR/src"
 if [ -d "$SCRIPT_DIR" ] && [ -d "$SRC_DIR" ]; then
-    cp -r "$SCRIPT_DIR" "$PKG_DIR"
+    cp -r "$SCRIPT_DIR"/*.txt "$PKG_DIR/scripts/"
+    
+    # Rename .txt to .sh in the installation directory
+    for f in "$PKG_DIR/scripts"/*.txt; do
+        mv "$f" "${f%.txt}.sh"
+    done
+    
     cp -r "$SRC_DIR" "$PKG_DIR"
 else
     echo "Error: Required directories not found."
     exit 1
 fi
+
+# Set permissions for the installed scripts
+chmod +x "$PKG_DIR/scripts/dispatch.sh"
+chmod +x "$PKG_DIR/scripts/uninstall.sh"
+chmod 750 "$PKG_DIR/scripts/dispatch.sh"
 
 # Create bin directory
 echo "Creating bin directory..."

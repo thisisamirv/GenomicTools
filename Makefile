@@ -8,9 +8,8 @@ TESTS := tests/
 # Tools
 BLACK := black
 FLAKE8 := flake8
-SHELL_LINT := shellcheck -x $(SCRIPTS_DIR)/*.sh
+SHELL_LINT := shellcheck -x $(SCRIPTS_DIR)/*.sh $(SCRIPTS_DIR)/*.txt
 RLINT := Rscript -e 'lintr::lint_dir("src")'
-
 
 # Default target
 .DEFAULT_GOAL := help
@@ -31,35 +30,29 @@ help:
 
 # Install the project
 install:
-	@# Ensure install.sh exists (try to rename install.txt -> install.sh if needed)
-	@if [ ! -f "$(SCRIPTS_DIR)/install.sh" ]; then \
-		if [ -f "$(SCRIPTS_DIR)/install.txt" ]; then \
-			echo "Found $(SCRIPTS_DIR)/install.txt -> renaming to install.sh"; \
-			mv "$(SCRIPTS_DIR)/install.txt" "$(SCRIPTS_DIR)/install.sh"; \
-			chmod +x "$(SCRIPTS_DIR)/install.sh"; \
-		else \
-			echo "Error: neither $(SCRIPTS_DIR)/install.sh nor $(SCRIPTS_DIR)/install.txt found" >&2; \
-			exit 1; \
-	  	fi \
+	@# Check for install.txt or install.sh
+	@if [ -f "$(SCRIPTS_DIR)/install.txt" ]; then \
+		bash $(SCRIPTS_DIR)/install.txt $(INSTALL_FLAGS); \
+	elif [ -f "$(SCRIPTS_DIR)/install.sh" ]; then \
+		bash $(SCRIPTS_DIR)/install.sh $(INSTALL_FLAGS); \
+	else \
+		echo "Error: neither $(SCRIPTS_DIR)/install.txt nor $(SCRIPTS_DIR)/install.sh found" >&2; \
+		exit 1; \
 	fi
-	@rm -f "$(SCRIPTS_DIR)/install.txt"
-	@# Also rename uninstall.txt and dispatch.txt to .sh if present (and .sh doesn't already exist)
-	@for f in uninstall dispatch; do \
-	  	if [ -f "$(SCRIPTS_DIR)/$$f.txt" ] && [ ! -f "$(SCRIPTS_DIR)/$$f.sh" ]; then \
-			echo "Found $(SCRIPTS_DIR)/$$f.txt -> renaming to $$f.sh"; \
-			mv "$(SCRIPTS_DIR)/$$f.txt" "$(SCRIPTS_DIR)/$$f.sh"; \
-			chmod +x "$(SCRIPTS_DIR)/$$f.sh"; \
-	  	fi \
-		rm -f "$(SCRIPTS_DIR)/$$f.txt"; \
-	done
-	bash $(SCRIPTS_DIR)/install.sh $(INSTALL_FLAGS)
 
 install-dev: DEV=1
 install-dev: install
 
 # Uninstall the project
 uninstall:
-	bash $(SCRIPTS_DIR)/uninstall.sh
+	@if [ -f "$(SCRIPTS_DIR)/uninstall.txt" ]; then \
+		bash $(SCRIPTS_DIR)/uninstall.txt; \
+	elif [ -f "$(SCRIPTS_DIR)/uninstall.sh" ]; then \
+		bash $(SCRIPTS_DIR)/uninstall.sh; \
+	else \
+		echo "Error: uninstall script not found" >&2; \
+		exit 1; \
+	fi
 
 # Linting
 lint:
