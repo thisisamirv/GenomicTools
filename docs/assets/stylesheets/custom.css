@@ -1,0 +1,6 @@
+/* Allow code blocks to wrap */
+pre code {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+

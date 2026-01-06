@@ -1,0 +1,10 @@
+[report]
+exclude_lines =
+	except Exception
+	if __name__ == .__main__.
+	except NameError
+	except RuntimeError
+	raise ValueError
+	except (ValueError, TypeError):
+	^\s*@numba\.jit
+

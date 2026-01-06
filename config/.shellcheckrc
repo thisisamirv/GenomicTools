@@ -1,0 +1,12 @@
+# Disable specific warning for echo with escape sequences
+disable=SC2028
+
+# Disable warnings about expansion in heredocs
+disable=SC2016
+disable=SC2086
+disable=SC2027
+disable=SC2129
+
+# Disable checking for man page generation blocks (more flexible pattern)
+disable-next=/\{[\s\S]*\} > "\$MAN_FILE"/
+

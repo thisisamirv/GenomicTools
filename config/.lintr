@@ -1,0 +1,2 @@
+linters: linters_with_defaults(line_length_linter = line_length_linter(120), indentation_linter = indentation_linter(indent = 4), object_name_linter = NULL)
+exclude: "log_info|log_debug|log_warn|log_error|setup_logger"

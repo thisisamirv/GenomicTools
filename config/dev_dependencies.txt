@@ -1,0 +1,13 @@
+black
+flake8
+mkdocs
+mkdocs-gen-files
+mkdocs-literate-nav
+mkdocs-material
+mkdocstrings
+patchelf
+pytest
+pytest-cov
+r-lintr
+shellcheck
+vim

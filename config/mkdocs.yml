@@ -1,0 +1,46 @@
+site_name: GenomicTools Documentation
+theme:
+  name: material
+  palette:
+    scheme: slate
+
+docs_dir: ../docs
+site_dir: ../site
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Usage: usage.md
+  - Uninstallation: uninstallation.md
+  - Reference:
+      - Overview: api/__overview.md
+      - Annotator: api/Annotator.md
+      - AssociationAnalysis: api/AssociationAnalysis.md
+      - ConvertCounts: api/ConvertCounts.md
+      - CountsQC: api/CountsQC.md
+      - EnrichmentORA: api/EnrichmentORA.md
+      - FeatureSelection: api/FeatureSelection.md
+      - GenomicPCA: api/GenomicPCA.md
+      - ImageEditor: api/ImageEditor.md
+      - ImportanceRank: api/ImportanceRank.md
+      - ImputeCounts: api/ImputeCounts.md
+      - MetaAssociation: api/MetaAssociation.md
+      - MultiTraitAssociation: api/MultiTraitAssociation.md
+      - PlotAssociationAnalysis: api/PlotAssociationAnalysis.md
+      - ProcessHDF5: api/ProcessHDF5.md
+      - Stats: api/Stats.md
+      - TransformData: api/TransformData.md
+      - VariantQC: api/VariantQC.md
+      - ViewHDF5: api/ViewHDF5.md
+
+extra_css:
+  - assets/stylesheets/custom.css
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+  - gen-files:
+      scripts: []
+  - literate-nav
+  - autorefs
