@@ -436,8 +436,8 @@ class CountsQC:
                 
                 actual_chrom = None
                 try:
-                    with CachedH5Utils(h5_file) as h5_utils_meta:
-                        actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
+                    h5_utils_meta = CachedH5Utils(h5_file)
+                    actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
                 except Exception:
                     actual_chrom = str(chromosome) if str(chromosome) in h5_file else None
                 
@@ -492,12 +492,12 @@ class CountsQC:
                         log.error(f"Error in marker call rate chunk processing: {e}")
 
                 config = H5Config(chunk_size=optimal_chunk)
-                with ChunkedH5Utils(h5_file, config=config) as h5_utils:
-                    h5_utils.read_chromosome_chunked(
-                        chromosome,
-                        data_type=self.data_type,
-                        chunk_callback=process_chunk
-                    )
+                h5_utils = ChunkedH5Utils(h5_file, config=config)
+                h5_utils.read_chromosome_chunked(
+                    chromosome,
+                    data_type=self.data_type,
+                    chunk_callback=process_chunk
+                )
                 
                 if not filtered_ids:
                     return None
@@ -518,9 +518,9 @@ class CountsQC:
                 
                 actual_chrom = None
                 try:
-                    with CachedH5Utils(h5_file) as h5_utils_meta:
-                        actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
-                        sample_names = h5_utils_meta._get_sample_names(h5_file, self.data_type, None)
+                    h5_utils_meta = CachedH5Utils(h5_file)
+                    actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
+                    sample_names = h5_utils_meta._get_sample_names(h5_file, self.data_type, None)
                 except Exception:
                     actual_chrom = str(chromosome) if str(chromosome) in h5_file else None
                     sample_names = None
@@ -555,12 +555,12 @@ class CountsQC:
                         log.error(f"Error in sample call rate chunk processing: {e}")
 
                 config = H5Config(chunk_size=optimal_chunk)
-                with ChunkedH5Utils(h5_file, config=config) as h5_utils:
-                    h5_utils.read_chromosome_chunked(
-                        chromosome,
-                        data_type=self.data_type,
-                        chunk_callback=process_chunk
-                    )
+                h5_utils = ChunkedH5Utils(h5_file, config=config)
+                h5_utils.read_chromosome_chunked(
+                    chromosome,
+                    data_type=self.data_type,
+                    chunk_callback=process_chunk
+                )
                 
                 return {
                     "non_missing": non_missing_counts,
@@ -597,17 +597,17 @@ class CountsQC:
                     # Calculate optimal chunk size for this chromosome based on available memory
                     # and number of samples (cols).
                     try:
-                        with CachedH5Utils(h5_file) as h5_utils_meta:
-                            actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
-                            if actual_chrom:
-                                chr_group_meta = h5_file[actual_chrom]
-                                ds_key = AliasUtils.find_keys(chr_group_meta, "Methylation")
-                                ds_obj = chr_group_meta[ds_key or "Methylation"]
-                                num_samples = ds_obj.shape[1]
-                                total_probes = ds_obj.shape[0]
-                            else:
-                                num_samples = 1000 # default fallback
-                                total_probes = 100000
+                        h5_utils_meta = CachedH5Utils(h5_file)
+                        actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
+                        if actual_chrom:
+                            chr_group_meta = h5_file[actual_chrom]
+                            ds_key = AliasUtils.find_keys(chr_group_meta, "Methylation")
+                            ds_obj = chr_group_meta[ds_key or "Methylation"]
+                            num_samples = ds_obj.shape[1]
+                            total_probes = ds_obj.shape[0]
+                        else:
+                            num_samples = 1000 # default fallback
+                            total_probes = 100000
                     except Exception as e:
                         log.debug(f"Metadata retrieval failed for chunking: {e}")
                         num_samples = 1000
@@ -618,40 +618,40 @@ class CountsQC:
                     config = H5Config(chunk_size=optimal_chunk)
                     log.debug(f"Using optimal chunk size {optimal_chunk} for {chromosome} ({num_samples} samples)")
 
-                    with ChunkedH5Utils(h5_file, config=config) as h5_utils:
-                        h5_utils.read_chromosome_chunked(
-                            chromosome, 
-                            data_type="Methylation",
-                            chunk_callback=process_chunk
-                        )
+                    h5_utils = ChunkedH5Utils(h5_file, config=config)
+                    h5_utils.read_chromosome_chunked(
+                        chromosome, 
+                        data_type="Methylation",
+                        chunk_callback=process_chunk
+                    )
                         
-                        # Now retrieve the probe IDs
-                        # We need to map the chromosome name first to find the group
-                        mapper = h5_utils.chromosome_mapper
-                        actual_chrom = mapper.map_chromosome_name(chromosome)
-                        if actual_chrom:
-                            chr_group = h5_file[actual_chrom]
-                            # Try multiple aliases for probe IDs to be robust (ProbeList is common for Methylation)
-                            probe_id_field = None
-                            for field in ["ProbeList", "CGID", "RSID", "ID"]:
-                                probe_id_field = AliasUtils.find_keys(chr_group, field)
-                                if probe_id_field:
-                                    break
+                    # Now retrieve the probe IDs
+                    # We need to map the chromosome name first to find the group
+                    mapper = h5_utils.chromosome_mapper
+                    actual_chrom = mapper.map_chromosome_name(chromosome)
+                    if actual_chrom:
+                        chr_group = h5_file[actual_chrom]
+                        # Try multiple aliases for probe IDs to be robust (ProbeList is common for Methylation)
+                        probe_id_field = None
+                        for field in ["ProbeList", "CGID", "RSID", "ID"]:
+                            probe_id_field = AliasUtils.find_keys(chr_group, field)
+                            if probe_id_field:
+                                break
 
-                            if probe_id_field is None:
-                                # Fallback if no specific ID field
-                                total_probes = sum(len(v) for v in chunk_variances)
-                                log.warn(f"Could not find probe ID field in {actual_chrom}. Falling back to generic names.")
-                                probe_ids = [f"probe_{i}" for i in range(total_probes)]
-                            else:
-                                probe_ids = chr_group[probe_id_field][:]
-                                if len(probe_ids) > 0 and isinstance(probe_ids[0], (bytes, np.bytes_)):
-                                    probe_ids = [s.decode("utf-8").rstrip('\x00').strip() for s in probe_ids]
-                                else:
-                                    probe_ids = [str(s).strip() for s in probe_ids]
+                        if probe_id_field is None:
+                            # Fallback if no specific ID field
+                            total_probes = sum(len(v) for v in chunk_variances)
+                            log.warn(f"Could not find probe ID field in {actual_chrom}. Falling back to generic names.")
+                            probe_ids = [f"probe_{i}" for i in range(total_probes)]
                         else:
-                            log.warn(f"Could not map chromosome {chromosome} for ID retrieval")
-                            return None
+                            probe_ids = chr_group[probe_id_field][:]
+                            if len(probe_ids) > 0 and isinstance(probe_ids[0], (bytes, np.bytes_)):
+                                probe_ids = [s.decode("utf-8").rstrip('\x00').strip() for s in probe_ids]
+                            else:
+                                probe_ids = [str(s).strip() for s in probe_ids]
+                    else:
+                        log.warn(f"Could not map chromosome {chromosome} for ID retrieval")
+                        return None
 
                 except Exception as e:
                     log.error(f"Error during chunked processing of {chromosome}: {e}")

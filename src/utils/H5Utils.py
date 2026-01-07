@@ -863,8 +863,9 @@ class ChromosomeLister(BaseH5Utils):
 
 
 class CachedH5Utils:
-    def __init__(self, h5_file: Any, config: Optional[H5Config] = None) -> None:
+    def __init__(self, h5_file: Any, config: Optional[H5Config] = None, owns_file: bool = False) -> None:
         self.h5_file = h5_file
+        self._owns_file = owns_file
         self.config = config or H5Config()
         self._cache: Optional[OrderedDict] = (
             OrderedDict() if self.config.cache_enabled else None
@@ -921,8 +922,8 @@ class CachedH5Utils:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
-        """Exit context manager and close HDF5 file if applicable."""
-        if hasattr(self.h5_file, "close"):
+        """Exit context manager and close HDF5 file if it owns it."""
+        if self._owns_file and hasattr(self.h5_file, "close"):
             self.h5_file.close()
         return False
 
@@ -1161,9 +1162,9 @@ class H5UtilsFactory:
         config.cache_enabled = enable_caching
 
         if enable_chunking:
-            return ChunkedH5Utils(h5_file, config)
+            return ChunkedH5Utils(h5_file, config, owns_file=True)
         else:
-            return CachedH5Utils(h5_file, config)
+            return CachedH5Utils(h5_file, config, owns_file=True)
 
     @staticmethod
     def create_utils_from_file(
