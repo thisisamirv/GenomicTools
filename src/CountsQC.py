@@ -13,7 +13,7 @@ from tqdm import tqdm
 from typing import Any, Dict, List, Optional, Union
 from utils.AliasUtils import AliasUtils
 from utils.CLIFramework import CLIFramework, OptionConfig
-from utils.H5Utils import CachedH5Utils
+from utils.H5Utils import CachedH5Utils, H5Config
 from utils.LoggingUtils import log
 from utils.SystemUtils import SystemUtils, monitor_resources
 
@@ -574,15 +574,49 @@ class CountsQC:
 
                 def process_chunk(chunk_data: np.ndarray):
                     """Callback to process each chunk of data."""
-                    # Calculate variance for the chunk
-                    # axis=1 means variance across samples for each probe
-                    variances = np.nanvar(chunk_data, axis=1)
+                    if not np.isnan(chunk_data).any():
+                        variances = np.var(chunk_data, axis=1)
+                    else:
+                        variances = np.nanvar(chunk_data, axis=1)
                     chunk_variances.append(variances)
                 
                 try:
-                    with ChunkedH5Utils(h5_file) as h5_utils:
-                        # We use read_chromosome_chunked with a callback
-                        # This avoids loading the whole data matrix into memory
+                    # Calculate optimal chunk size for this chromosome based on available memory
+                    # and number of samples (cols).
+                    # Target using ~10% of available RAM per worker for the data buffer
+                    try:
+                        with CachedH5Utils(h5_file) as h5_utils_meta:
+                            actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
+                            if actual_chrom:
+                                chr_group_meta = h5_file[actual_chrom]
+                                ds_key = AliasUtils.find_keys(chr_group_meta, "Methylation")
+                                ds_obj = chr_group_meta[ds_key or "Methylation"]
+                                num_samples = ds_obj.shape[1]
+                                total_probes = ds_obj.shape[0]
+                            else:
+                                num_samples = 1000 # default fallback
+                                total_probes = 100000
+                    except Exception as e:
+                        log.debug(f"Metadata retrieval failed for chunking: {e}")
+                        num_samples = 1000
+                        total_probes = 100000
+
+                    memory_info = SystemUtils.get_memory_info()
+                    avail_mem = memory_info.get("available_gb", 8.0) * 1024**3
+                    # Be aggressive: use up to 10% of available memory for this worker's chunk
+                    target_mem = (avail_mem * 0.10) / self.max_workers
+                    
+                    # Size of one row (probes are rows, samples are cols)
+                    row_size = num_samples * 4 # float32
+                    optimal_chunk = int(target_mem / row_size)
+                    # Stay between 2k and 100k, but don't exceed total probes
+                    optimal_chunk = min(100000, max(2000, optimal_chunk))
+                    optimal_chunk = min(total_probes, optimal_chunk)
+                    
+                    config = H5Config(chunk_size=optimal_chunk)
+                    log.debug(f"Using optimal chunk size {optimal_chunk} for {chromosome} ({num_samples} samples)")
+
+                    with ChunkedH5Utils(h5_file, config=config) as h5_utils:
                         h5_utils.read_chromosome_chunked(
                             chromosome, 
                             data_type="Methylation",
@@ -595,15 +629,24 @@ class CountsQC:
                         actual_chrom = mapper.map_chromosome_name(chromosome)
                         if actual_chrom:
                             chr_group = h5_file[actual_chrom]
-                            probe_id_field = AliasUtils.find_keys(chr_group, "CGID")
+                            # Try multiple aliases for probe IDs to be robust (ProbeList is common for Methylation)
+                            probe_id_field = None
+                            for field in ["ProbeList", "CGID", "RSID", "ID"]:
+                                probe_id_field = AliasUtils.find_keys(chr_group, field)
+                                if probe_id_field:
+                                    break
+
                             if probe_id_field is None:
                                 # Fallback if no specific ID field
                                 total_probes = sum(len(v) for v in chunk_variances)
+                                log.warn(f"Could not find probe ID field in {actual_chrom}. Falling back to generic names.")
                                 probe_ids = [f"probe_{i}" for i in range(total_probes)]
                             else:
                                 probe_ids = chr_group[probe_id_field][:]
-                                if isinstance(probe_ids[0], bytes):
+                                if len(probe_ids) > 0 and isinstance(probe_ids[0], (bytes, np.bytes_)):
                                     probe_ids = [s.decode("utf-8").rstrip('\x00').strip() for s in probe_ids]
+                                else:
+                                    probe_ids = [str(s).strip() for s in probe_ids]
                         else:
                             log.warn(f"Could not map chromosome {chromosome} for ID retrieval")
                             return None
@@ -864,9 +907,13 @@ class CountsQC:
                 open(self.output_file, "w").close()
                 log.success("Empty output file created")
                 return self.output_file
+            
             combined_results = pd.concat(variances_list, ignore_index=True)
-            del variances_list
+            for df in variances_list:
+                del df
+            variances_list.clear()
             gc.collect()
+            
             combined_results = combined_results.dropna(subset=["variance"])
             log.info(f"Combined results contain {len(combined_results)} probes.")
             variance_threshold = combined_results["variance"].quantile(self.threshold)
@@ -931,6 +978,11 @@ class CountsQC:
                     f"CPU: {stats['max_cpu']:.1f}%, Memory: {stats['max_memory']:.1f}%"
                 )
                 raise e
+            finally:
+                log.debug("Starting cleanup and shutdown...")
+                self._cleanup()
+                log.stop_multiprocessing_logging()
+                log.debug("Shutdown complete.")
 
 
 options = [
