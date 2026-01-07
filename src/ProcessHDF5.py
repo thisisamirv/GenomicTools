@@ -1222,6 +1222,17 @@ class ProcessHDF5:
             full_sample_list, selected_samples = self._get_sample_info(h5_file)
             self.markers_dict = self._get_marker_info(h5_file)
 
+            entity_type = "probes" if self.data_type == "Methylation" else "SNPs"
+            # SAFETY CHECK: If markers were requested but none found, stop early
+            if self.marker_ids and not self.markers_dict:
+                log.error(f"None of the {len(self.marker_ids)} requested {entity_type} were found.")
+                return False
+
+            # SAFETY CHECK: If samples were requested but none found, stop early
+            if self.sample_ids and not selected_samples:
+                log.error("None of the requested samples were found.")
+                return False
+
             if self.operation == "subset":
                 chromosomes_to_process = [
                     chr
