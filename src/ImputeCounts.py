@@ -141,16 +141,13 @@ class FastKNNImputer:
         return self._sampling_based_imputation(X, missing_mask)
 
     def _mean_imputation(self, X: np.ndarray, missing_mask: np.ndarray) -> np.ndarray:
+        """Vectorized mean imputation - replaces NaN with column means."""
         X_imputed = X.copy()
         col_means = np.nanmean(X, axis=0)
-
-        all_nan_cols = np.isnan(col_means)
-        col_means[all_nan_cols] = 0.0
-
-        for j in range(X.shape[1]):
-            if missing_mask[:, j].any():
-                X_imputed[missing_mask[:, j], j] = col_means[j]
-
+        # Handle all-NaN columns
+        col_means = np.where(np.isnan(col_means), 0.0, col_means)
+        # Vectorized: broadcast column means to missing positions
+        X_imputed = np.where(missing_mask, col_means, X_imputed)
         return X_imputed
 
     def _sampling_based_imputation(
@@ -213,6 +210,10 @@ class FastKNNImputer:
             log.warn(f"KNN model building failed: {e}, using mean imputation")
             return self._mean_imputation(X, missing_mask)
 
+        # Pre-compute column means once (avoids repeated np.nanmean in loop)
+        col_means = np.nanmean(X, axis=0)
+        col_means = np.where(np.isnan(col_means), 0.0, col_means)
+        
         samples_imputed = 0
         for i in range(n_samples):
             if not missing_mask[i].any():
@@ -221,9 +222,9 @@ class FastKNNImputer:
             sample_usable = X[i, usable_features]
 
             if np.isnan(sample_usable).any():
-                for j in np.where(missing_mask[i])[0]:
-                    col_mean = np.nanmean(X[:, j])
-                    X_imputed[i, j] = col_mean if not np.isnan(col_mean) else 0.0
+                # Use pre-computed column means
+                missing_cols = np.where(missing_mask[i])[0]
+                X_imputed[i, missing_cols] = col_means[missing_cols]
                 continue
 
             try:
@@ -231,23 +232,22 @@ class FastKNNImputer:
                 neighbor_indices = complete_sample_indices[indices[0]]
                 neighbors = X[neighbor_indices]
 
-                for j in np.where(missing_mask[i])[0]:
+                missing_cols = np.where(missing_mask[i])[0]
+                for j in missing_cols:
                     neighbor_vals = neighbors[:, j]
                     valid_vals = neighbor_vals[~np.isnan(neighbor_vals)]
 
                     if len(valid_vals) > 0:
                         X_imputed[i, j] = np.mean(valid_vals)
                     else:
-                        col_mean = np.nanmean(X[:, j])
-                        X_imputed[i, j] = col_mean if not np.isnan(col_mean) else 0.0
+                        X_imputed[i, j] = col_means[j]
 
                 samples_imputed += 1
 
             except Exception as e:
                 log.debug(f"KNN failed for sample {i}: {e}, using mean imputation")
-                for j in np.where(missing_mask[i])[0]:
-                    col_mean = np.nanmean(X[:, j])
-                    X_imputed[i, j] = col_mean if not np.isnan(col_mean) else 0.0
+                missing_cols = np.where(missing_mask[i])[0]
+                X_imputed[i, missing_cols] = col_means[missing_cols]
 
         log.debug(f"Successfully imputed {samples_imputed} samples using KNN")
 
