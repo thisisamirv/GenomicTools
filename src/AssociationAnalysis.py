@@ -516,22 +516,32 @@ class AssociationAnalysisLauncher:
             return None
 
     def _decode_string_array(self, array: Any) -> List[str]:
-        decoded: List[str] = []
-        for item in array:
-            if isinstance(item, (bytes, np.bytes_)):
-                for enc in ("utf-8", "latin-1"):
-                    try:
-                        decoded.append(item.decode(enc))
-                        break
-                    except Exception:
-                        continue
-                else:
-                    decoded.append(str(item))
-            elif isinstance(item, np.str_):
-                decoded.append(str(item))
-            else:
-                decoded.append(str(item))
-        return decoded
+        """Decode bytes array, detecting encoding once and stripping null padding."""
+        if len(array) == 0:
+            return []
+        
+        first = array[0]
+        # Detect encoding from first element
+        if isinstance(first, (bytes, np.bytes_)):
+            detected_encoding = None
+            for enc in ("utf-8", "latin-1", "ascii"):
+                try:
+                    first.decode(enc)
+                    detected_encoding = enc
+                    break
+                except Exception:
+                    continue
+            
+            if detected_encoding:
+                try:
+                    return [item.decode(detected_encoding).rstrip('\x00').strip() for item in array]
+                except Exception:
+                    pass
+            # Fallback
+            return [str(item).rstrip('\x00').strip() for item in array]
+        
+        # Already strings
+        return [str(item).strip() for item in array]
 
     def _extract_h5_paths(self) -> Dict[str, Any]:
         log.info(f"Extracting HDF5 paths from {self.h5_file}")
@@ -579,58 +589,75 @@ class AssociationAnalysisLauncher:
 
             if self.analysis_type == "EWAS":
                 valid_chr_groups = []
+                # Once we find the keys in one group, reuse them for others
+                probe_key_cached = None
+                beta_key_cached = None
                 for chr_group in chr_groups:
                     try:
                         grp = h5f[chr_group]
-                        probe_key = AliasUtils.find_keys(
+                        # Use cached keys if available, otherwise search
+                        probe_key = probe_key_cached or AliasUtils.find_keys(
                             grp, "ProbeList"
                         ) or AliasUtils.find_keys(grp, "CGID")
-                        beta_key = AliasUtils.find_keys(
+                        beta_key = beta_key_cached or AliasUtils.find_keys(
                             grp, "betas"
                         ) or AliasUtils.find_keys(grp, "Methylation")
-                        if probe_key and beta_key:
+                        
+                        # Verify keys exist in this group
+                        if probe_key in grp and beta_key in grp:
                             valid_chr_groups.append(chr_group)
-                            if paths["probe_list_name"] is None:
+                            # Cache for subsequent groups
+                            if probe_key_cached is None:
+                                probe_key_cached = probe_key
                                 paths["probe_list_name"] = probe_key
-                            if paths["betas_name"] is None:
+                            if beta_key_cached is None:
+                                beta_key_cached = beta_key
                                 paths["betas_name"] = beta_key
                     except Exception as e:
                         log.debug(f"Error checking group {chr_group}: {e}")
                 paths["chrom_groups"] = valid_chr_groups
             else:
                 valid_chr_groups = []
+                # Cache keys once found
+                rsid_key_cached = None
+                geno_key_cached = None
+                a1_key_cached = None
+                a2_key_cached = None
+                bp_key_cached = None
+                
                 for chr_group in chr_groups:
                     try:
                         grp = h5f[chr_group]
-                        rsid_key = AliasUtils.find_keys(
+                        rsid_key = rsid_key_cached or AliasUtils.find_keys(
                             grp, "RSID"
                         ) or AliasUtils.find_keys(grp, "SNP")
-                        geno_key = AliasUtils.find_keys(
+                        geno_key = geno_key_cached or AliasUtils.find_keys(
                             grp, "Genotype"
                         ) or AliasUtils.find_keys(grp, "genotypes")
-                        if rsid_key and geno_key:
+                        
+                        if rsid_key in grp and geno_key in grp:
                             valid_chr_groups.append(chr_group)
-                            if paths["variant_list_name"] is None:
+                            # Cache keys on first success
+                            if rsid_key_cached is None:
+                                rsid_key_cached = rsid_key
                                 paths["variant_list_name"] = rsid_key
-                            if paths["geno_name"] is None:
+                            if geno_key_cached is None:
+                                geno_key_cached = geno_key
                                 paths["geno_name"] = geno_key
-                            if paths["a1_path"] is None:
-                                a1_key = AliasUtils.find_keys(
-                                    grp, "A1"
-                                ) or AliasUtils.find_keys(grp, "REF")
-                                if a1_key:
+                            if a1_key_cached is None:
+                                a1_key = AliasUtils.find_keys(grp, "A1") or AliasUtils.find_keys(grp, "REF")
+                                if a1_key and a1_key in grp:
+                                    a1_key_cached = a1_key
                                     paths["a1_path"] = a1_key
-                            if paths["a2_path"] is None:
-                                a2_key = AliasUtils.find_keys(
-                                    grp, "A2"
-                                ) or AliasUtils.find_keys(grp, "ALT")
-                                if a2_key:
+                            if a2_key_cached is None:
+                                a2_key = AliasUtils.find_keys(grp, "A2") or AliasUtils.find_keys(grp, "ALT")
+                                if a2_key and a2_key in grp:
+                                    a2_key_cached = a2_key
                                     paths["a2_path"] = a2_key
-                            if paths["bp_path"] is None:
-                                bp_key = AliasUtils.find_keys(
-                                    grp, "BP"
-                                ) or AliasUtils.find_keys(grp, "POS")
-                                if bp_key:
+                            if bp_key_cached is None:
+                                bp_key = AliasUtils.find_keys(grp, "BP") or AliasUtils.find_keys(grp, "POS")
+                                if bp_key and bp_key in grp:
+                                    bp_key_cached = bp_key
                                     paths["bp_path"] = bp_key
                     except Exception as e:
                         log.debug(f"Error checking group {chr_group}: {e}")
