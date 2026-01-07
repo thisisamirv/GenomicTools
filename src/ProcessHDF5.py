@@ -723,33 +723,53 @@ class ProcessHDF5:
     def _get_marker_info(self, h5_file: h5py.File) -> Dict[str, List[str]]:
         if not self.marker_ids:
             return {}
+        
         entity_type = "probes" if self.data_type == "Methylation" else "SNPs"
         h5_utils = CachedH5Utils(h5_file)
         all_chroms = h5_utils.get_chromosomes()
-        chr_list = (
-            [c for c in all_chroms if c in self.chromosomes]
-            if self.chromosomes
-            else all_chroms
+        
+        mapped_chroms, missing_req = self._map_requested_chromosomes(
+            self.chromosomes, all_chroms
         )
-        first_chr = chr_list[0] if chr_list else "chr1"
-        # Use AliasUtils to find the actual marker key in the HDF5 file
-        marker_alias = "ProbeList" if self.data_type == "Methylation" else "RSID"
-        marker_key = AliasUtils.find_keys(h5_file[first_chr], marker_alias)
-        if not marker_key:
-            log.warn(f"Could not find marker key '{marker_alias}' in {first_chr}")
+        
+        # If user didn't specify chromosomes, scan all available ones
+        chr_list = mapped_chroms if (self.chromosomes and mapped_chroms) else all_chroms
+        
+        if not chr_list:
+            log.warn("No valid chromosomes found for marker scanning")
             return {}
+
+        # Use the first available chromosome to find the marker dataset key
+        sample_chr = chr_list[0]
+        marker_alias = "ProbeList" if self.data_type == "Methylation" else "RSID"
+        marker_key = AliasUtils.find_keys(h5_file[sample_chr], marker_alias)
+        
+        if not marker_key:
+            log.warn(f"Could not find marker key '{marker_alias}' in {sample_chr}")
+            return {}
+            
         marker_suffix = f"/{marker_key}"
         markers_dict: Dict[str, List[str]] = {}
-        remaining_markers = set(str(m) for m in self.marker_ids)
+        
+        # Normalize requested marker IDs: strip whitespace and convert to string
+        requested_markers = set(str(m).strip() for m in self.marker_ids)
+        remaining_markers = requested_markers.copy()
+        
+        log.info(f"Scanning {len(chr_list)} chromosomes for {len(requested_markers)} {entity_type}")
+        
         for chr in tqdm(chr_list, desc="Scanning chromosomes"):
             if not remaining_markers: # Early exit if all markers found
                 break
+                
             marker_path = f"/{chr}{marker_suffix}"
             if marker_path not in h5_file:
                 continue
+                
+            # Decode array and ensure whitespace/null bytes are stripped
             chr_markers = self._decode_array(h5_file[marker_path][:])
-            chr_set = set(chr_markers)
+            chr_set = set(m.strip() for m in chr_markers)
             
+            # Use set intersection for O(min(len(remaining_markers), len(chr_set)))
             found_in_chr = remaining_markers.intersection(chr_set)
             if found_in_chr:
                 markers_dict[chr] = list(found_in_chr)
@@ -757,6 +777,27 @@ class ProcessHDF5:
                 
         if remaining_markers:
             log.warn(f"Missing {len(remaining_markers)} {entity_type}")
+            
+            # DIAGNOSTICS: Help identify why markers are missing
+            missing_sample = list(remaining_markers)[:5]
+            log.warn(f"Sample missing {entity_type}: {missing_sample}")
+            
+            # Check a sample chromosome to see what the markers actually look like
+            sample_chr_path = f"/{sample_chr}{marker_suffix}"
+            if sample_chr_path in h5_file:
+                actual_sample = self._decode_array(h5_file[sample_chr_path][:5])
+                log.warn(f"Markers in {sample_chr} look like: {actual_sample}")
+                
+                # Check for case-insensitive matches
+                lower_remaining = set(m.lower() for m in remaining_markers)
+                chr_markers_full = self._decode_array(h5_file[sample_chr_path][:])
+                chr_lower = set(m.lower().strip() for m in chr_markers_full)
+                
+                case_matches = lower_remaining.intersection(chr_lower)
+                if case_matches:
+                    log.warn(f"Found {len(case_matches)} case-insensitive matches in {sample_chr}. Data may be case-sensitive.")
+                    log.warn(f"Sample case matches: {list(case_matches)[:3]}")
+
         return markers_dict
 
     def _get_indices_for_chromosome(
