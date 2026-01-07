@@ -740,25 +740,28 @@ class ProcessHDF5:
             return {}
         marker_suffix = f"/{marker_key}"
         markers_dict: Dict[str, List[str]] = {}
-        marker_set = set(str(m) for m in self.marker_ids)
-        found: set = set()
+        remaining_markers = set(str(m) for m in self.marker_ids)
         for chr in tqdm(chr_list, desc="Scanning chromosomes"):
+            if not remaining_markers: # Early exit if all markers found
+                break
             marker_path = f"/{chr}{marker_suffix}"
             if marker_path not in h5_file:
                 continue
             chr_markers = self._decode_array(h5_file[marker_path][:])
             chr_set = set(chr_markers)
-            chr_markers_found = [m for m in marker_set - found if m in chr_set]
-            if chr_markers_found:
-                markers_dict[chr] = chr_markers_found
-                found.update(chr_markers_found)
-        if len(found) < len(marker_set):
-            log.warn(f"Missing {len(marker_set - found)} {entity_type}")
+            
+            found_in_chr = remaining_markers.intersection(chr_set)
+            if found_in_chr:
+                markers_dict[chr] = list(found_in_chr)
+                remaining_markers.difference_update(found_in_chr)
+                
+        if remaining_markers:
+            log.warn(f"Missing {len(remaining_markers)} {entity_type}")
         return markers_dict
 
     def _get_indices_for_chromosome(
         self, h5_file: h5py.File, chromosome: str
-    ) -> Tuple[List[int], Optional[List[int]]]:
+    ) -> Tuple[List[int], Optional[List[int]], List[str]]:
         marker_key = (
             AliasUtils.find_keys(h5_file[chromosome], "ProbeList")
             if self.data_type == "Methylation"
@@ -776,7 +779,7 @@ class ProcessHDF5:
         if self.marker_ids:
             chr_markers = self.markers_dict.get(chromosome, [])
             if not chr_markers:
-                return [], self.sample_indices
+                return [], self.sample_indices, marker_list
             # Build index lookup dict once: O(n), then lookups are O(1) each
             marker_to_idx = {m: i for i, m in enumerate(marker_list)}
             marker_indices = [
@@ -789,7 +792,7 @@ class ProcessHDF5:
                 marker_indices = []
             else:
                 marker_indices = list(range(len(marker_list)))
-        return marker_indices, self.sample_indices
+        return marker_indices, self.sample_indices, marker_list
 
     def process_chromosome_hdf5(self, chromosome: str) -> Tuple[str, Optional[str]]:
         temp_filename = f"{chromosome}_{int(time.time() * 1000)}.h5"
@@ -801,7 +804,7 @@ class ProcessHDF5:
                     temp_path, "w"
                 ) as temp_file:
                     temp_file.create_group(chromosome)
-                    affected_marker_idx, affected_sample_idx = (
+                    affected_marker_idx, affected_sample_idx, marker_list = (
                         self._get_indices_for_chromosome(h5_file, chromosome)
                     )
                     affected_sample_idx = (
@@ -813,7 +816,7 @@ class ProcessHDF5:
                         if self.data_type == "Methylation"
                         else AliasUtils.find_keys(h5_file[chromosome], "Genotype")
                     )
-                    data_shape = h5_file[
+                    data_dataset = h5_file[
                         paths[
                             (
                                 data_key
@@ -825,47 +828,48 @@ class ProcessHDF5:
                                 )
                             )
                         ]
-                    ].shape
+                    ]
+                    data_shape = data_dataset.shape
                     marker_path_key = (
                         "CGID" if self.data_type == "Methylation" else "RSID"
                     )
-                    marker_list = self._decode_array(h5_file[paths[marker_path_key]][:])
-                    all_marker_idx = list(
-                        range(
-                            data_shape[0]
-                            if self.data_type != "Methylation"
-                            else data_shape[1]
-                        )
+                    # Deduplicated list of markers for faster membership tests
+                    all_marker_idx = range(
+                        data_shape[0]
+                        if self.data_type != "Methylation"
+                        else data_shape[1]
                     )
-                    all_sample_idx = list(
-                        range(
-                            data_shape[1]
-                            if self.data_type != "Methylation"
-                            else data_shape[0]
-                        )
+                    all_sample_idx = range(
+                        data_shape[1]
+                        if self.data_type != "Methylation"
+                        else data_shape[0]
                     )
+                    
                     if self.operation == "subset":
                         if self.marker_ids and not affected_marker_idx:
                             return chromosome, None
                         keep_marker = (
-                            affected_marker_idx if self.marker_ids else all_marker_idx
+                            affected_marker_idx if self.marker_ids else list(all_marker_idx)
                         )
                         keep_sample = (
-                            affected_sample_idx if self.sample_ids else all_sample_idx
+                            affected_sample_idx if self.sample_ids else list(all_sample_idx)
                         )
-                        filtered_markers = [marker_list[i] for i in keep_marker]
                     else:
+                        affected_marker_set = set(affected_marker_idx)
+                        affected_sample_set = set(affected_sample_idx)
+                        
                         keep_marker = [
                             i
                             for i in all_marker_idx
-                            if i not in set(affected_marker_idx)
+                            if i not in affected_marker_set
                         ]
                         keep_sample = [
                             i
                             for i in all_sample_idx
-                            if i not in set(affected_sample_idx)
+                            if i not in affected_sample_set
                         ]
-                        filtered_markers = [marker_list[i] for i in keep_marker]
+                    
+                    filtered_markers = [marker_list[i] for i in keep_marker]
                     if len(keep_marker) == 0 or len(keep_sample) == 0:
                         return chromosome, None
                     data_path_key = (
@@ -921,13 +925,23 @@ class ProcessHDF5:
                     sorted_col_idx = np.sort(col_idx_arr)
                     
                     # Process in chunks to avoid OOM
-                    processing_chunk_size = min(1000, max(100, out_rows // 10))
-                    log.debug(f"Processing in chunks of {processing_chunk_size} rows")
+                    available_mem = psutil.virtual_memory().available
+                    target_mem = available_mem * 0.1
+                    dtype_itemsize = source_dtype.itemsize
+                    row_size = out_cols * dtype_itemsize
                     
-                    # Pre-compute column reorder once (sorted read -> original order)
-                    col_order_map = {v: i for i, v in enumerate(col_idx)}
-                    col_reorder_indices = np.array([col_order_map[c] for c in sorted_col_idx])
-                    col_inverse = np.argsort(col_reorder_indices)
+                    # Ideal number of rows to process at once
+                    processing_chunk_size = int(target_mem / row_size)
+                    # Stay between 100 and 10,000 to keep progress bar moving but avoid excessive overhead
+                    processing_chunk_size = min(10000, max(100, processing_chunk_size))
+                    # Don't exceed total rows
+                    processing_chunk_size = min(out_rows, processing_chunk_size)
+                    
+                    log.debug(f"Processing in chunks of {processing_chunk_size} rows (based on {available_mem/1e9:.1f}GB available RAM)")
+                    
+                    # Pre-compute column reorder once using np.argsort
+                    # This maps sorted indices back to original requested order
+                    col_reorder_indices = np.argsort(np.argsort(col_idx))
                     
                     # Process rows in sorted order for efficient reads, write to contiguous output
                     out_row_write_pos = 0
@@ -938,8 +952,8 @@ class ProcessHDF5:
                         # Read chunk from source (sorted indices for efficient read)
                         chunk_data = source_dataset[chunk_row_indices, :][:, sorted_col_idx]
                         
-                        # Reorder columns to match original col_idx order
-                        chunk_data = chunk_data[:, col_inverse]
+                        # Reorder columns to match original col_idx order using pre-computed indices
+                        chunk_data = chunk_data[:, col_reorder_indices]
                         
                         # Write entire chunk as contiguous block
                         chunk_rows = chunk_end - chunk_start
@@ -959,21 +973,26 @@ class ProcessHDF5:
                         for ds_name in paths["Additional"]:
                             ds_path = f"/{chromosome}/{ds_name}"
                             if ds_path in h5_file:
-                                original_ds = h5_file[ds_path][:]
-                                filtered_ds = (
-                                    original_ds[keep_marker]
-                                    if len(original_ds) == len(marker_list)
-                                    else original_ds
-                                )
-                                if len(filtered_ds) > 0 and isinstance(
-                                    filtered_ds[0], bytes
-                                ):
+                                original_ds = h5_file[ds_path]
+                                # Use fancy indexing directly on HDF5 dataset to avoid loading full array
+                                # only if it matches marker count
+                                if len(original_ds) == len(marker_list):
+                                    idx_arr = np.array(keep_marker)
+                                    sorted_idx = np.sort(idx_arr)
+                                    # HDF5 requires sorted indices for fancy indexing
+                                    filtered_ds = original_ds[sorted_idx]
+                                    # Reorder back to preserved order if it was a subset operation with specific order
+                                    reorder = np.argsort(np.argsort(idx_arr))
+                                    filtered_ds = filtered_ds[reorder]
+                                else:
+                                    filtered_ds = original_ds[:]
+                                
+                                # Optimization: Handle decoding without full list creation if possible
+                                if len(filtered_ds) > 0 and isinstance(filtered_ds[0], (bytes, np.bytes_)):
                                     filtered_ds = self._decode_array(filtered_ds)
                                     temp_file.create_dataset(
                                         ds_path,
-                                        data=np.array(
-                                            filtered_ds, dtype=h5py.string_dtype()
-                                        ),
+                                        data=np.array(filtered_ds, dtype=h5py.string_dtype()),
                                         compression="gzip",
                                         compression_opts=4,
                                     )
@@ -1147,13 +1166,14 @@ class ProcessHDF5:
             for missing_chr in missing:
                 log.warn(f"Chromosome {missing_chr} not found in HDF5 file")
 
+            mapped_chromosomes_set = set(mapped_chromosomes)
             if self.operation == "subset":
                 chromosome_list = (
                     mapped_chromosomes if mapped_chromosomes else all_chromosomes
                 )
             else:
                 chromosome_list = [
-                    chr for chr in all_chromosomes if chr not in mapped_chromosomes
+                    chr for chr in all_chromosomes if chr not in mapped_chromosomes_set
                 ]
                 if not chromosome_list and mapped_chromosomes:
                     log.info("All requested chromosomes will be removed from output")
@@ -1170,7 +1190,7 @@ class ProcessHDF5:
                 kept_sample_names = selected_samples
             else:
                 chromosomes_to_process = chromosome_list
-                remove_indices = self.sample_indices if self.sample_ids else []
+                remove_indices = set(self.sample_indices) if self.sample_ids else set()
                 keep_idx = [
                     i for i in range(len(full_sample_list)) if i not in remove_indices
                 ]
