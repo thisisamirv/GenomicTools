@@ -408,8 +408,32 @@ class ProcessHDF5:
     def _decode_array(self, arr: Union[np.ndarray, List[Any]]) -> List[str]:
         if len(arr) == 0:
             return []
-        if isinstance(arr[0], bytes):
-            return [x.decode("utf-8") for x in arr]
+        first = arr[0]
+        # Handle bytes - detect encoding once using first element
+        if isinstance(first, bytes):
+            # Try encodings on first element only
+            detected_encoding = None
+            for encoding in ("utf-8", "latin-1", "ascii"):
+                try:
+                    first.decode(encoding)
+                    detected_encoding = encoding
+                    break
+                except (UnicodeDecodeError, AttributeError):
+                    continue
+            if detected_encoding:
+                try:
+                    return [x.decode(detected_encoding) for x in arr]
+                except (UnicodeDecodeError, AttributeError):
+                    pass
+            # Fallback to str() if nothing works
+            return [str(x) for x in arr]
+        # Handle numpy bytes/string types
+        if hasattr(first, "decode"):
+            try:
+                return [x.decode("utf-8") for x in arr]
+            except (UnicodeDecodeError, AttributeError):
+                return [str(x) for x in arr]
+        # Handle regular strings or other types
         return [str(x) for x in arr if not pd.isna(x)]
 
     def _normalize_sample_ids(self, sample_list: List[Any]) -> List[str]:
@@ -889,36 +913,36 @@ class ProcessHDF5:
                     
                     # Sort indices for efficient HDF5 access
                     # HDF5 requires sorted indices for efficient fancy indexing
-                    sorted_row_idx = np.array(sorted(row_idx))
-                    sorted_col_idx = np.array(sorted(col_idx))
-                    
-                    # For the output, we want to preserve the original order of row_idx
-                    # Create a mapping from sorted position to output position
-                    row_sorted_to_original = {v: i for i, v in enumerate(row_idx)}
-                    col_sorted_to_original = {v: i for i, v in enumerate(col_idx)}
-                    
-                    # Build reorder arrays: these map from sorted-read order to output order
-                    row_reorder = np.array([row_sorted_to_original[r] for r in sorted_row_idx])
-                    col_reorder = np.array([col_sorted_to_original[c] for c in sorted_col_idx])
+                    row_idx_arr = np.array(row_idx)
+                    col_idx_arr = np.array(col_idx)
+                    sorted_row_idx = np.sort(row_idx_arr)
+                    sorted_col_idx = np.sort(col_idx_arr)
                     
                     # Process in chunks to avoid OOM
                     processing_chunk_size = min(1000, max(100, out_rows // 10))
                     log.debug(f"Processing in chunks of {processing_chunk_size} rows")
                     
+                    # Pre-compute column reorder once (sorted read -> original order)
+                    col_order_map = {v: i for i, v in enumerate(col_idx)}
+                    col_reorder_indices = np.array([col_order_map[c] for c in sorted_col_idx])
+                    col_inverse = np.argsort(col_reorder_indices)
+                    
+                    # Process rows in sorted order for efficient reads, write to contiguous output
+                    out_row_write_pos = 0
                     for chunk_start in range(0, len(sorted_row_idx), processing_chunk_size):
                         chunk_end = min(chunk_start + processing_chunk_size, len(sorted_row_idx))
                         chunk_row_indices = sorted_row_idx[chunk_start:chunk_end]
-                        chunk_row_reorder = row_reorder[chunk_start:chunk_end]
                         
                         # Read chunk from source (sorted indices for efficient read)
                         chunk_data = source_dataset[chunk_row_indices, :][:, sorted_col_idx]
                         
                         # Reorder columns to match original col_idx order
-                        chunk_data = chunk_data[:, np.argsort(col_reorder)]
+                        chunk_data = chunk_data[:, col_inverse]
                         
-                        # Write each row to its correct output position
-                        for i, out_row_pos in enumerate(chunk_row_reorder):
-                            out_dataset[out_row_pos, :] = chunk_data[i, :]
+                        # Write entire chunk as contiguous block
+                        chunk_rows = chunk_end - chunk_start
+                        out_dataset[out_row_write_pos:out_row_write_pos + chunk_rows, :] = chunk_data
+                        out_row_write_pos += chunk_rows
                         
                         del chunk_data
                         gc.collect()
