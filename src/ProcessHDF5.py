@@ -776,12 +776,13 @@ class ProcessHDF5:
             chr_markers = self.markers_dict.get(chromosome, [])
             if not chr_markers:
                 return [], self.sample_indices
-            marker_indices: List[int] = []
-            for marker in chr_markers:
-                try:
-                    marker_indices.append(marker_list.index(str(marker)))
-                except ValueError:
-                    continue
+            # Build index lookup dict once: O(n), then lookups are O(1) each
+            marker_to_idx = {m: i for i, m in enumerate(marker_list)}
+            marker_indices = [
+                marker_to_idx[str(marker)]
+                for marker in chr_markers
+                if str(marker) in marker_to_idx
+            ]
         else:
             if self.operation == "remove":
                 marker_indices = []
