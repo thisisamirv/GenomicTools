@@ -19,6 +19,9 @@ from utils.SystemUtils import SystemUtils, monitor_resources
 
 
 class CountsQC:
+    # Class constant for metadata columns to avoid repeated list creation
+    METADATA_COLS = frozenset(["CHR", "BP", "A1", "A2", "INFO", "DataType"])
+    
     def __init__(
         self,
         input_file: str,
@@ -342,60 +345,50 @@ class CountsQC:
             raise
 
     def _get_missing_value_condition(self, data_values: Any) -> np.ndarray:
+        """Detect missing values based on data type and dtype."""
+        dtype = getattr(data_values, "dtype", None)
+        is_float = dtype is not None and np.issubdtype(dtype, np.floating)
+        is_int = dtype is not None and np.issubdtype(dtype, np.integer)
+        
         try:
-            if hasattr(data_values, "dtype"):
-                dtype = data_values.dtype
-                log.debug(f"Data dtype: {dtype}")
-            else:
-                dtype = None
             if self.data_type == "Methylation":
-                if dtype is not None and np.issubdtype(dtype, np.floating):
+                # Methylation: NaN for floats, sentinel values for ints
+                if is_float:
                     return np.isnan(data_values)
-                elif dtype is not None and np.issubdtype(dtype, np.integer):
-                    return (
-                        (data_values == -1) | (data_values == -999) | (data_values == 0)
-                    )
-                else:
-                    try:
-                        return np.isnan(data_values.astype(float))
-                    except (ValueError, TypeError):
-                        return data_values == -1
-            else:
-                if dtype is not None and np.issubdtype(dtype, np.integer):
+                if is_int:
+                    return (data_values == -1) | (data_values == -999) | (data_values == 0)
+                # Unknown type: try float conversion
+                try:
+                    return np.isnan(data_values.astype(float))
+                except (ValueError, TypeError):
                     return data_values == -1
-                elif dtype is not None and np.issubdtype(dtype, np.floating):
+            else:
+                # Genotype: -1 is missing, NaN for floats
+                if is_int:
+                    return data_values == -1
+                if is_float:
                     return np.isnan(data_values) | (data_values == -1)
-                else:
-                    if hasattr(data_values, "astype"):
-                        try:
-                            numeric_data = pd.to_numeric(
-                                data_values.flatten(), errors="coerce"
-                            )
-                            numeric_data = numeric_data.reshape(data_values.shape)
-                            return np.isnan(numeric_data) | (numeric_data == -1)
-                        except (ValueError, TypeError):
-                            val1 = data_values == "-1"
-                            val2 = data_values == "NA"
-                            val3 = data_values == "nan"
-                            val4 = data_values == ""
-                            return val1 | val2 | val3 | val4
-                    else:
-                        return data_values == -1
+                # Unknown type: try numeric conversion
+                try:
+                    numeric_data = pd.to_numeric(data_values.flatten(), errors="coerce")
+                    numeric_data = numeric_data.reshape(data_values.shape)
+                    return np.isnan(numeric_data) | (numeric_data == -1)
+                except (ValueError, TypeError, AttributeError):
+                    # String-based fallback
+                    return (
+                        (data_values == "-1") | (data_values == "NA") |
+                        (data_values == "nan") | (data_values == "")
+                    )
         except Exception as e:
             log.error(f"Error in missing value detection: {e}")
-            log.debug(
-                f"Data type: {type(data_values)}, shape: {getattr(data_values, 'shape', 'unknown')}"
-            )
-            try:
-                return data_values == -1
-            except Exception:
+            # Fallback chain
+            for check in [lambda d: d == -1, lambda d: np.isnan(d)]:
                 try:
-                    return np.isnan(data_values)
+                    return check(data_values)
                 except Exception:
-                    log.warn(
-                        "Could not detect missing values, assuming no missing data"
-                    )
-                    return np.zeros(getattr(data_values, "shape", (0,)), dtype=bool)
+                    continue
+            log.warn("Could not detect missing values, assuming no missing data")
+            return np.zeros(getattr(data_values, "shape", (0,)), dtype=bool)
 
     def _read_chromosome_data_direct(
         self, h5_file: h5py.File, chromosome: Union[str, int]
@@ -453,8 +446,7 @@ class CountsQC:
                 else:
                     id_col = chr_data[id_col_name]
                     data_cols = [col for col in chr_data.columns if col != id_col_name]
-                metadata_cols = ["CHR", "BP", "A1", "A2", "INFO", "DataType"]
-                data_cols = [col for col in data_cols if col not in metadata_cols]
+                data_cols = [col for col in data_cols if col not in self.METADATA_COLS]
                 if not data_cols:
                     log.warn(f"No data columns found for chromosome {chromosome}")
                     return None
@@ -523,9 +515,8 @@ class CountsQC:
                 else:
                     data_cols = [col for col in chr_data.columns if col != id_col_name]
                     sample_names = data_cols
-                metadata_cols = ["CHR", "BP", "A1", "A2", "INFO", "DataType"]
-                data_cols = [col for col in data_cols if col not in metadata_cols]
-                sample_names = [col for col in sample_names if col not in metadata_cols]
+                data_cols = [col for col in data_cols if col not in self.METADATA_COLS]
+                sample_names = [col for col in sample_names if col not in self.METADATA_COLS]
                 if hasattr(chr_data, "select_dtypes"):
                     numeric_data = chr_data[data_cols].select_dtypes(
                         include=[np.number]
@@ -612,7 +603,7 @@ class CountsQC:
                             else:
                                 probe_ids = chr_group[probe_id_field][:]
                                 if isinstance(probe_ids[0], bytes):
-                                    probe_ids = [s.decode("utf-8") for s in probe_ids]
+                                    probe_ids = [s.decode("utf-8").rstrip('\x00').strip() for s in probe_ids]
                         else:
                             log.warn(f"Could not map chromosome {chromosome} for ID retrieval")
                             return None
