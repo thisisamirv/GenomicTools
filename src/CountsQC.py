@@ -186,26 +186,30 @@ class CountsQC:
             )
             log.info(f"Defaulting to {self.max_workers} workers")
 
-    def _calculate_chunk_size(self, total_items: int) -> int:
-        memory_per_worker = self.available_memory / max(1, self.max_workers)
+    def _calculate_optimal_chunk_size(
+        self, num_samples: int, total_items: int
+    ) -> int:
+        """Calculate optimal chunk size based on available memory and worker count."""
+        try:
+            # target using ~10% of available memory per worker for the data buffer
+            target_mem = (self.available_memory * 1024**3 * 0.10) / max(
+                1, self.max_workers
+            )
 
-        if total_items <= 10000:
-            return max(1000, min(5000, total_items))
+            # Size of one row (markers/probes are rows, samples are cols)
+            # Assume float32 (4 bytes) per data point as a safe baseline
+            row_size = num_samples * 4
+            if row_size == 0:
+                return 10000
 
-        if self.metric == "sample_call_rate":
-            base_chunk = int(memory_per_worker * 2000)
-        else:
-            base_chunk = int(memory_per_worker * 10000)
+            optimal_chunk = int(target_mem / row_size)
 
-        min_chunk = 1000
-        max_chunk = min(100000, max(1000, total_items // 10))
-
-        chunk_size = max(min_chunk, min(base_chunk, max_chunk))
-        log.info(
-            f"Calculated chunk size: {chunk_size} (from {total_items} total items)"
-        )
-
-        return chunk_size
+            # Stay between 1k and 100k, but don't exceed total items
+            optimal_chunk = min(100000, max(1000, optimal_chunk))
+            return min(total_items, optimal_chunk)
+        except Exception as e:
+            log.debug(f"Error calculating optimal chunk size: {e}")
+            return min(total_items, 10000)
 
     def _setup_temp_directory(self) -> str:
         output_dir = os.path.dirname(os.path.abspath(self.output_file))
@@ -427,135 +431,144 @@ class CountsQC:
         try:
             log.debug(f"Processing chromosome: {chromosome}")
             with h5py.File(self.input_file, "r") as h5_file:
+                # 1. Map chromosome and find logical fields
+                from utils.H5Utils import ChunkedH5Utils, CachedH5Utils, H5Config
+                
+                actual_chrom = None
                 try:
-                    with CachedH5Utils(h5_file) as h5_utils:
-                        chr_data = h5_utils.read_chromosome(
-                            chromosome, data_type=self.data_type
-                        )
-                except Exception as e:
-                    log.debug(f"CachedH5Utils failed: {e}, trying direct read")
-                    chr_data = self._read_chromosome_data_direct(h5_file, chromosome)
-                if chr_data is None or chr_data.empty:
-                    log.warn(f"No data found for chromosome: {chromosome}")
+                    with CachedH5Utils(h5_file) as h5_utils_meta:
+                        actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
+                except Exception:
+                    actual_chrom = str(chromosome) if str(chromosome) in h5_file else None
+                
+                if not actual_chrom:
+                    log.warn(f"Chromosome {chromosome} not found")
                     return None
-                id_field = "CGID" if self.data_type == "Methylation" else "RSID"
-                id_col_name = AliasUtils.find_keys(chr_data, id_field)
-                if id_col_name is None:
-                    id_col = chr_data.iloc[:, 0]
-                    data_cols = chr_data.columns[1:]
+                    
+                chr_group = h5_file[actual_chrom]
+                data_key = AliasUtils.find_keys(chr_group, self.data_type or "Methylation")
+                id_field = "ProbeList" if self.data_type == "Methylation" else "RSID"
+                id_key = AliasUtils.find_keys(chr_group, id_field) or AliasUtils.find_keys(chr_group, "CGID") or AliasUtils.find_keys(chr_group, "ID")
+                
+                if not data_key or not id_key:
+                    log.error(f"Required datasets not found in chromosome {chromosome}")
+                    return None
+                    
+                ds_obj = chr_group[data_key]
+                num_probes, num_samples = ds_obj.shape
+                
+                # 2. Get optimal chunk size
+                optimal_chunk = self._calculate_optimal_chunk_size(num_samples, num_probes)
+                log.debug(f"Using chunk size {optimal_chunk} for {chromosome}")
+                
+                # 3. Read IDs (usually small enough to fit in memory)
+                id_values = chr_group[id_key][:]
+                if len(id_values) > 0 and isinstance(id_values[0], (bytes, np.bytes_)):
+                    id_values = [s.decode("utf-8").rstrip('\x00').strip() for s in id_values]
                 else:
-                    id_col = chr_data[id_col_name]
-                    data_cols = [col for col in chr_data.columns if col != id_col_name]
-                data_cols = [col for col in data_cols if col not in self.METADATA_COLS]
-                if not data_cols:
-                    log.warn(f"No data columns found for chromosome {chromosome}")
-                    return None
-                data_values = chr_data[data_cols].values
-                log.debug(
-                    f"Data shape: {data_values.shape}, dtype: {data_values.dtype}"
-                )
-                try:
-                    missing_condition = self._get_missing_value_condition(data_values)
-                    call_rate_values = (~missing_condition).sum(
-                        axis=1
-                    ) / data_values.shape[1]
-                    call_rate_values = np.round(call_rate_values, 3)
-                except Exception as e:
-                    log.error(f"Error calculating missing values for {chromosome}: {e}")
-                    return None
-                below_threshold_indices = call_rate_values <= self.threshold
-                below_threshold_count = below_threshold_indices.sum()
-                if below_threshold_count == 0:
-                    entity_type = (
-                        "probes" if self.data_type == "Methylation" else "SNPs"
+                    id_values = [str(s).strip() for s in id_values]
+                
+                # 4. Process in chunks
+                filtered_ids = []
+                offset = 0
+                
+                def process_chunk(chunk_data: np.ndarray):
+                    nonlocal offset
+                    try:
+                        missing_condition = self._get_missing_value_condition(chunk_data)
+                        # axis=1 is across samples (for each marker)
+                        call_rate = (~missing_condition).sum(axis=1) / chunk_data.shape[1]
+                        
+                        below_threshold = call_rate <= self.threshold
+                        if below_threshold.any():
+                            # Extract IDs for this chunk that are below threshold
+                            chunk_ids = id_values[offset : offset + len(chunk_data)]
+                            for i, is_below in enumerate(below_threshold):
+                                if is_below:
+                                    filtered_ids.append(chunk_ids[i])
+                        
+                        offset += len(chunk_data)
+                    except Exception as e:
+                        log.error(f"Error in marker call rate chunk processing: {e}")
+
+                config = H5Config(chunk_size=optimal_chunk)
+                with ChunkedH5Utils(h5_file, config=config) as h5_utils:
+                    h5_utils.read_chromosome_chunked(
+                        chromosome,
+                        data_type=self.data_type,
+                        chunk_callback=process_chunk
                     )
-                    log.debug(
-                        f"No {entity_type} below the threshold for chromosome: {chromosome}"
-                    )
+                
+                if not filtered_ids:
                     return None
-                filtered_results = pd.DataFrame(id_col[below_threshold_indices])
-                entity_type = "probes" if self.data_type == "Methylation" else "SNPs"
-                log.debug(
-                    f"Number of {entity_type} below the threshold for chromosome {chromosome}: {len(filtered_results)}"
-                )
-                return filtered_results
+                    
+                return pd.DataFrame({id_key: filtered_ids})
+                
         except Exception as e:
-            log.error(f"Error processing chromosome {chromosome}: {e}")
+            log.error(f"Error processing chromosome {chromosome} marker call rate: {e}")
             return None
 
     def process_chromosome_sample_call_rate(
         self, chromosome: Union[str, int]
     ) -> Optional[Dict[str, Any]]:
         try:
-            log.debug(f"Worker process: Starting for chromosome {chromosome}")
+            log.debug(f"Processing chromosome: {chromosome} for sample call rate")
             with h5py.File(self.input_file, "r") as h5_file:
-                log.debug(f"Worker: Opened file for chromosome {chromosome}")
+                from utils.H5Utils import ChunkedH5Utils, CachedH5Utils, H5Config
+                
+                actual_chrom = None
                 try:
-                    with CachedH5Utils(h5_file) as h5_utils:
-                        log.debug(
-                            f"Worker: Using CachedH5Utils for chromosome {chromosome}"
-                        )
-                        chr_data = h5_utils.read_chromosome(
-                            chromosome, data_type=self.data_type
-                        )
-                except Exception as e:
-                    log.debug(
-                        f"Worker: CachedH5Utils failed for {chromosome}, using direct read: {str(e)}"
-                    )
-                    chr_data = self._read_chromosome_data_direct(h5_file, chromosome)
-                if chr_data is None or chr_data.empty:
-                    log.warn(f"Worker: No data for chromosome {chromosome}")
+                    with CachedH5Utils(h5_file) as h5_utils_meta:
+                        actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
+                        sample_names = h5_utils_meta._get_sample_names(h5_file, self.data_type, None)
+                except Exception:
+                    actual_chrom = str(chromosome) if str(chromosome) in h5_file else None
+                    sample_names = None
+                
+                if not actual_chrom:
                     return None
-                log.debug(f"Worker: Got data for chromosome {chromosome}")
-                id_field = "CGID" if self.data_type == "Methylation" else "RSID"
-                id_col_name = AliasUtils.find_keys(chr_data, id_field)
-                if id_col_name is None:
-                    data_cols = chr_data.columns[1:]
-                    sample_names = list(data_cols)
-                else:
-                    data_cols = [col for col in chr_data.columns if col != id_col_name]
-                    sample_names = data_cols
-                data_cols = [col for col in data_cols if col not in self.METADATA_COLS]
-                sample_names = [col for col in sample_names if col not in self.METADATA_COLS]
-                if hasattr(chr_data, "select_dtypes"):
-                    numeric_data = chr_data[data_cols].select_dtypes(
-                        include=[np.number]
-                    )
-                    if len(numeric_data.columns) != len(data_cols):
-                        log.debug("Filtered out non-numeric columns.")
-                        log.debug(
-                            f"Original: {len(data_cols)}, Numeric: {len(numeric_data.columns)}"
-                        )
-                        data_cols = list(numeric_data.columns)
-                        sample_names = [
-                            name for name in sample_names if name in data_cols
-                        ]
-                if not data_cols:
-                    log.warn(
-                        f"No numeric data columns found for chromosome {chromosome}"
-                    )
+                    
+                chr_group = h5_file[actual_chrom]
+                data_key = AliasUtils.find_keys(chr_group, self.data_type or "Methylation")
+                if not data_key:
                     return None
-                data_values = chr_data[data_cols].values
-                log.debug(
-                    f"Worker: Final data shape for {chromosome}: {data_values.shape}, dtype: {data_values.dtype}"
-                )
-                try:
-                    missing_condition = self._get_missing_value_condition(data_values)
-                    non_missing_counts = np.sum(~missing_condition, axis=0)
-                    num_markers = data_values.shape[0]
-                except Exception as e:
-                    log.error(f"Error calculating missing values for {chromosome}: {e}")
-                    return None
-                log.debug(
-                    f"Worker: Completed processing for {chromosome}, markers: {num_markers}"
-                )
+                    
+                ds_obj = chr_group[data_key]
+                num_probes, num_samples = ds_obj.shape
+                
+                if sample_names is None or len(sample_names) != num_samples:
+                    sample_names = [f"sample_{i}" for i in range(num_samples)]
+                
+                # 1. Optimal chunk size
+                optimal_chunk = self._calculate_optimal_chunk_size(num_samples, num_probes)
+                
+                # 2. Process in chunks
+                non_missing_counts = np.zeros(num_samples, dtype=np.int64)
+                
+                def process_chunk(chunk_data: np.ndarray):
+                    try:
+                        missing_condition = self._get_missing_value_condition(chunk_data)
+                        # axis=0 is across probes (for each sample in this chunk)
+                        chunk_non_missing = (~missing_condition).sum(axis=0)
+                        non_missing_counts[:] += chunk_non_missing
+                    except Exception as e:
+                        log.error(f"Error in sample call rate chunk processing: {e}")
+
+                config = H5Config(chunk_size=optimal_chunk)
+                with ChunkedH5Utils(h5_file, config=config) as h5_utils:
+                    h5_utils.read_chromosome_chunked(
+                        chromosome,
+                        data_type=self.data_type,
+                        chunk_callback=process_chunk
+                    )
+                
                 return {
                     "non_missing": non_missing_counts,
-                    "num_markers": np.full(len(non_missing_counts), num_markers),
+                    "num_markers": np.full(num_samples, num_probes),
                     "sample_names": sample_names,
                 }
         except Exception as e:
-            log.error(f"Worker error processing chromosome {chromosome}: {e}")
+            log.error(f"Error processing chromosome {chromosome} sample call rate: {e}")
             return None
 
     def process_chromosome_probe_variance(
@@ -583,7 +596,6 @@ class CountsQC:
                 try:
                     # Calculate optimal chunk size for this chromosome based on available memory
                     # and number of samples (cols).
-                    # Target using ~10% of available RAM per worker for the data buffer
                     try:
                         with CachedH5Utils(h5_file) as h5_utils_meta:
                             actual_chrom = h5_utils_meta.chromosome_mapper.map_chromosome_name(chromosome)
@@ -601,17 +613,7 @@ class CountsQC:
                         num_samples = 1000
                         total_probes = 100000
 
-                    memory_info = SystemUtils.get_memory_info()
-                    avail_mem = memory_info.get("available_gb", 8.0) * 1024**3
-                    # Be aggressive: use up to 10% of available memory for this worker's chunk
-                    target_mem = (avail_mem * 0.10) / self.max_workers
-                    
-                    # Size of one row (probes are rows, samples are cols)
-                    row_size = num_samples * 4 # float32
-                    optimal_chunk = int(target_mem / row_size)
-                    # Stay between 2k and 100k, but don't exceed total probes
-                    optimal_chunk = min(100000, max(2000, optimal_chunk))
-                    optimal_chunk = min(total_probes, optimal_chunk)
+                    optimal_chunk = self._calculate_optimal_chunk_size(num_samples, total_probes)
                     
                     config = H5Config(chunk_size=optimal_chunk)
                     log.debug(f"Using optimal chunk size {optimal_chunk} for {chromosome} ({num_samples} samples)")
