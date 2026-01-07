@@ -173,20 +173,20 @@ class BaseH5Utils:
 
     @staticmethod
     def _decode_if_bytes(data: Any) -> str:
-        """Decode bytes to UTF-8 string if necessary."""
+        """Decode bytes to UTF-8 string if necessary, stripping null bytes."""
         if isinstance(data, bytes):
             try:
-                return data.decode("utf-8")
+                return data.decode("utf-8").rstrip('\x00').strip()
             except UnicodeDecodeError:
                 try:
-                    return data.decode("latin-1")
+                    return data.decode("latin-1").rstrip('\x00').strip()
                 except UnicodeDecodeError:
-                    return str(data)
-        return str(data)
+                    return str(data).rstrip('\x00').strip()
+        return str(data).strip()
 
     @staticmethod
     def _decode_array(array: Iterable[Any]) -> List[str]:
-        """Decode an array of bytes to strings if necessary."""
+        """Decode an array of bytes to strings if necessary, stripping null bytes."""
         arr_list = list(array)
         if not arr_list:
             return []
@@ -195,12 +195,12 @@ class BaseH5Utils:
         if isinstance(first, bytes):
             # Try utf-8 first for all, fallback per-element only on failure
             try:
-                return [x.decode("utf-8") for x in arr_list]
+                return [x.decode("utf-8").rstrip('\x00').strip() for x in arr_list]
             except UnicodeDecodeError:
                 return [BaseH5Utils._decode_if_bytes(x) for x in arr_list]
         elif isinstance(first, str):
-            return arr_list
-        return [str(x) for x in arr_list]
+            return [x.rstrip('\x00').strip() for x in arr_list]
+        return [str(x).strip() for x in arr_list]
 
     @staticmethod
     def _normalize_sample_id_list(sample_ids: Iterable[Any]) -> List[str]:

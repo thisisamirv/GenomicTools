@@ -152,9 +152,9 @@ class ProcessHDF5:
             return True
 
         if health.get("status") == "critical":
-            log.error("CRITICAL SYSTEM ISSUES:")
+            log.warn("CRITICAL SYSTEM ISSUES:")
             for issue in health.get("critical", []):
-                log.error(f"  - {issue}")
+                log.warn(f"  - {issue}")
             return False
 
         if health.get("status") == "warning":
@@ -422,19 +422,20 @@ class ProcessHDF5:
                     continue
             if detected_encoding:
                 try:
-                    return [x.decode(detected_encoding) for x in arr]
+                    # Strip null bytes and whitespace (common in fixed-width HDF5 strings)
+                    return [x.decode(detected_encoding).rstrip('\x00').strip() for x in arr]
                 except (UnicodeDecodeError, AttributeError):
                     pass
             # Fallback to str() if nothing works
-            return [str(x) for x in arr]
-        # Handle numpy bytes/string types
+            return [str(x).rstrip('\x00').strip() for x in arr]
+        # Handle numpy bytes/string types (numpy.bytes_)
         if hasattr(first, "decode"):
             try:
-                return [x.decode("utf-8") for x in arr]
+                return [x.decode("utf-8").rstrip('\x00').strip() for x in arr]
             except (UnicodeDecodeError, AttributeError):
-                return [str(x) for x in arr]
+                return [str(x).rstrip('\x00').strip() for x in arr]
         # Handle regular strings or other types
-        return [str(x) for x in arr if not pd.isna(x)]
+        return [str(x).strip() for x in arr if not pd.isna(x)]
 
     def _normalize_sample_ids(self, sample_list: List[Any]) -> List[str]:
         normalized: List[str] = []
