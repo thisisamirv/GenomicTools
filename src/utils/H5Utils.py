@@ -175,27 +175,57 @@ class BaseH5Utils:
     def _decode_if_bytes(data: Any) -> str:
         """Decode bytes to UTF-8 string if necessary."""
         if isinstance(data, bytes):
-            return data.decode("utf-8")
+            try:
+                return data.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    return data.decode("latin-1")
+                except UnicodeDecodeError:
+                    return str(data)
         return str(data)
 
     @staticmethod
     def _decode_array(array: Iterable[Any]) -> List[str]:
         """Decode an array of bytes to strings if necessary."""
-        return [BaseH5Utils._decode_if_bytes(item) for item in array]
+        arr_list = list(array)
+        if not arr_list:
+            return []
+        first = arr_list[0]
+        # Detect type once, apply to all
+        if isinstance(first, bytes):
+            # Try utf-8 first for all, fallback per-element only on failure
+            try:
+                return [x.decode("utf-8") for x in arr_list]
+            except UnicodeDecodeError:
+                return [BaseH5Utils._decode_if_bytes(x) for x in arr_list]
+        elif isinstance(first, str):
+            return arr_list
+        return [str(x) for x in arr_list]
 
     @staticmethod
     def _normalize_sample_id_list(sample_ids: Iterable[Any]) -> List[str]:
         """Normalize sample IDs to strings, converting numeric IDs appropriately."""
+        id_list = list(sample_ids)
+        if not id_list:
+            return []
+        
+        first = id_list[0]
+        # Fast path: if first element is already a clean string, likely all are
+        if isinstance(first, str) and not first.replace('.', '').replace('-', '').isdigit():
+            return id_list
+        
+        # Otherwise, normalize each
         normalized: List[str] = []
-        for sid in sample_ids:
+        for sid in id_list:
+            sid_str = str(sid)
             try:
-                float_val = float(str(sid))
+                float_val = float(sid_str)
                 if float_val.is_integer():
                     normalized.append(str(int(float_val)))
                 else:
-                    normalized.append(str(sid))
+                    normalized.append(sid_str)
             except (ValueError, TypeError):
-                normalized.append(str(sid))
+                normalized.append(sid_str)
         return normalized
 
     @staticmethod
@@ -772,20 +802,21 @@ class MarkerIndexer(BaseH5Utils):
                 return None
 
             marker_list_raw = chr_group[marker_key][:]
-            marker_list = [self._decode_if_bytes(m) for m in marker_list_raw]
+            marker_list = self._decode_array(marker_list_raw)
 
             if marker_ids:
-                marker_ids_str = [str(m) for m in marker_ids]
-                indices = [i for i, m in enumerate(marker_list) if m in marker_ids_str]
+                # Use set for O(1) lookup instead of list O(n)
+                marker_ids_set = set(str(m) for m in marker_ids)
+                indices = [i for i, m in enumerate(marker_list) if m in marker_ids_set]
 
                 if not indices:
                     log.debug(
-                        f"Found 0 of {len(list(marker_ids))} requested {marker_type} in {actual_chromosome}"
+                        f"Found 0 of {len(marker_ids_set)} requested {marker_type} in {actual_chromosome}"
                     )
                     return None
 
                 log.debug(
-                    f"Found {len(indices)} of {len(list(marker_ids))} requested {marker_type} in {actual_chromosome}"
+                    f"Found {len(indices)} of {len(marker_ids_set)} requested {marker_type} in {actual_chromosome}"
                 )
             else:
                 indices = list(range(len(marker_list)))
