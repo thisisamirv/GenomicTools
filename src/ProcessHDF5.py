@@ -707,9 +707,13 @@ class ProcessHDF5:
             else all_chroms
         )
         first_chr = chr_list[0] if chr_list else "chr1"
-        paths = self._get_data_paths(first_chr, h5_file)
-        paths_key = "CGID" if self.data_type == "Methylation" else "RSID"
-        marker_suffix = paths[paths_key].replace(f"/{first_chr}", "")
+        # Use AliasUtils to find the actual marker key in the HDF5 file
+        marker_alias = "ProbeList" if self.data_type == "Methylation" else "RSID"
+        marker_key = AliasUtils.find_keys(h5_file[first_chr], marker_alias)
+        if not marker_key:
+            log.warn(f"Could not find marker key '{marker_alias}' in {first_chr}")
+            return {}
+        marker_suffix = f"/{marker_key}"
         markers_dict: Dict[str, List[str]] = {}
         marker_set = set(str(m) for m in self.marker_ids)
         found: set = set()
@@ -841,39 +845,84 @@ class ProcessHDF5:
                     data_path_key = (
                         "Methylation" if self.data_type == "Methylation" else "Genotype"
                     )
-                    original_data = h5_file[paths[data_path_key]][:]
+                    
+                    # Get the source dataset without loading it fully
+                    source_dataset = h5_file[paths[data_path_key]]
+                    source_dtype = source_dataset.dtype
+                    
                     row_idx = (
                         keep_marker if self.data_type != "Methylation" else keep_sample
                     )
                     col_idx = (
                         keep_sample if self.data_type != "Methylation" else keep_marker
                     )
-                    filtered_data = original_data[np.ix_(row_idx, col_idx)]
-
-                    row_chunk = min(
-                        filtered_data.shape[0],
-                        max(32, int(filtered_data.shape[0] / 10)),
-                    )
-                    filtered_cols = filtered_data.shape[1]
-                    dtype_itemsize = filtered_data.dtype.itemsize
+                    
+                    # Output shape after filtering
+                    out_rows = len(row_idx)
+                    out_cols = len(col_idx)
+                    
+                    if out_rows == 0 or out_cols == 0:
+                        return chromosome, None
+                    
+                    # Calculate chunk sizes for the output dataset
+                    row_chunk = min(out_rows, max(32, int(out_rows / 10)))
                     base_bytes = 32 * 1024 * 1024
+                    dtype_itemsize = source_dtype.itemsize
                     row_divisor = max(1, row_chunk)
                     computed = int(base_bytes / dtype_itemsize / row_divisor)
-                    min_allowed = max(1, computed)
-                    col_chunk = min(filtered_cols, min_allowed)
-
+                    col_chunk = min(out_cols, max(1, computed))
                     chunk_size = (row_chunk, col_chunk)
+                    
                     log.debug(
-                        f"Using chunk size {chunk_size} for filtered data shape {filtered_data.shape}"
+                        f"Creating output dataset with shape ({out_rows}, {out_cols}), chunks {chunk_size}"
                     )
-
-                    temp_file.create_dataset(
+                    
+                    # Create the output dataset with the final shape
+                    out_dataset = temp_file.create_dataset(
                         paths[data_path_key],
-                        data=filtered_data,
+                        shape=(out_rows, out_cols),
+                        dtype=source_dtype,
                         chunks=chunk_size,
                         compression="gzip",
                         compression_opts=4,
                     )
+                    
+                    # Sort indices for efficient HDF5 access
+                    # HDF5 requires sorted indices for efficient fancy indexing
+                    sorted_row_idx = np.array(sorted(row_idx))
+                    sorted_col_idx = np.array(sorted(col_idx))
+                    
+                    # For the output, we want to preserve the original order of row_idx
+                    # Create a mapping from sorted position to output position
+                    row_sorted_to_original = {v: i for i, v in enumerate(row_idx)}
+                    col_sorted_to_original = {v: i for i, v in enumerate(col_idx)}
+                    
+                    # Build reorder arrays: these map from sorted-read order to output order
+                    row_reorder = np.array([row_sorted_to_original[r] for r in sorted_row_idx])
+                    col_reorder = np.array([col_sorted_to_original[c] for c in sorted_col_idx])
+                    
+                    # Process in chunks to avoid OOM
+                    processing_chunk_size = min(1000, max(100, out_rows // 10))
+                    log.debug(f"Processing in chunks of {processing_chunk_size} rows")
+                    
+                    for chunk_start in range(0, len(sorted_row_idx), processing_chunk_size):
+                        chunk_end = min(chunk_start + processing_chunk_size, len(sorted_row_idx))
+                        chunk_row_indices = sorted_row_idx[chunk_start:chunk_end]
+                        chunk_row_reorder = row_reorder[chunk_start:chunk_end]
+                        
+                        # Read chunk from source (sorted indices for efficient read)
+                        chunk_data = source_dataset[chunk_row_indices, :][:, sorted_col_idx]
+                        
+                        # Reorder columns to match original col_idx order
+                        chunk_data = chunk_data[:, np.argsort(col_reorder)]
+                        
+                        # Write each row to its correct output position
+                        for i, out_row_pos in enumerate(chunk_row_reorder):
+                            out_dataset[out_row_pos, :] = chunk_data[i, :]
+                        
+                        del chunk_data
+                        gc.collect()
+                    
                     temp_file.create_dataset(
                         paths[marker_path_key],
                         data=np.array(filtered_markers, dtype=h5py.string_dtype()),
